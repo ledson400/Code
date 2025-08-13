@@ -1,7 +1,5 @@
 # Requires PowerShell 7+
 # Prerequisites
-Import-Module Az
-Import-Module AzTable
 
 param (
     [string]$storageAccountName,
@@ -14,6 +12,9 @@ if (-not $storageAccountName -or -not $resourceGroup) {
     Write-Host "Usage: .\azStorageCheck.ps1 -storageAccountName <SAname> -resourceGroup <RG>" -ForegroundColor Yellow
     exit 1
 }
+
+Import-Module Az
+Import-Module AzTable
 
 # Configuration
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -39,6 +40,10 @@ $tableParams = foreach ($table in $tables) {
         StorageUri   = $ctx.TableEndpoint.AbsoluteUri
     }
 }
+
+# Create a named mutex for synchronized file access
+$mutexName = "AzStorageCheckMutex"
+$mutex = New-Object System.Threading.Mutex($false, $mutexName)
 
 # Run parallel processing
 $results = $tableParams | ForEach-Object -Parallel {
@@ -89,7 +94,7 @@ $results = $tableParams | ForEach-Object -Parallel {
         $estKB = [math]::Round(($avgSize * $totalEntities) / 1024, 2)
         $estMB = [math]::Round($estKB / 1024, 2)
 
-        [PSCustomObject]@{
+        $result = [PSCustomObject]@{
             TableName       = $tableName
             EntityCount     = $totalEntities
             AvgRowSizeBytes = $avgSize
@@ -97,15 +102,31 @@ $results = $tableParams | ForEach-Object -Parallel {
             EstimatedSizeMB = $estMB
         }
 
+        # Append to log file safely using mutex
+        $mutex = [System.Threading.Mutex]::OpenExisting($using:mutexName)
+        $mutex.WaitOne() | Out-Null
+        try {
+            if ($result -ne $null) {
+                $result | Export-Csv -Path $using:logFile -NoTypeInformation -Append
+            }
+        } finally {
+            $mutex.ReleaseMutex() | Out-Null
+            $mutex.Close()
+        }
+
+        $result
+
     } catch {
         Write-Warning "Error processing table ${tableName}: $_"
         return $null
     }
 } -ThrottleLimit 4
 
-# Clean and export results
+# Clean up mutex
+$mutex.Close()
+
+# Clean and display results
 $results = $results | Where-Object { $_ -ne $null }
-$results | Export-Csv -Path $logFile -NoTypeInformation
 $results | Sort-Object EstimatedSizeMB -Descending | Format-Table -AutoSize
 
 Write-Host "`nLog written to: $logFile"
